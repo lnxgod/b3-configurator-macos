@@ -1,0 +1,111 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check architecture and release version
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          if [[ "$REF_TYPE" == tag ]]; then
+            version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' native-macos/Info.plist)
+            test "$REF_NAME" = "v$version"
+          fi
+      - name: Build, self-test, sign and verify archive
+        run: ./native-macos/build.sh
+      - name: Verify package checksum
+        working-directory: dist
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: shasum -a 256 -c "B3-Configurator-macOS-$EXPECTED_ARCH.zip.sha256"
+      - name: Upload verified app package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/B3-Configurator-macOS-${{ matrix.arch }}.zip
+            dist/B3-Configurator-macOS-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  release:
+    name: Publish downloadable release
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download both verified builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: dist
+      - name: Verify release assets
+        working-directory: dist
+        run: |
+          test -f B3-Configurator-macOS-arm64.zip
+          test -f B3-Configurator-macOS-x86_64.zip
+          sha256sum --check B3-Configurator-macOS-arm64.zip.sha256
+          sha256sum --check B3-Configurator-macOS-x86_64.zip.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Native macOS app for setting the blafili B3 Bluetooth name and PIN over USB.
+
+          **Download the ZIP for your Mac:**
+          - Apple Silicon (M-series): `B3-Configurator-macOS-arm64.zip`
+          - Intel: `B3-Configurator-macOS-x86_64.zip`
+
+          Requires macOS 12 or later. Extract the ZIP, open B3 Configurator.app, connect one B3 with a USB data cable, and choose Check connection. No Python, compiler or separate driver is needed. Keep USB connected until changes finish verification; the B3 restarts and audio pauses.
+
+          These builds are ad hoc signed and **not notarized**. macOS may require explicit first-launch approval. See [Apple's guidance](https://support.apple.com/en-us/102445) and the repository README.
+
+          Both architectures were built by GitHub Actions with offline self-tests, app-signature verification, archive extraction checks and SHA-256 checksums. CI does not test USB hardware. Download the named app ZIP, rather than GitHub's source-code archive.
+          NOTES
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "B3 Configurator $RELEASE_TAG for macOS" \
+            --notes-file release-notes.md \
+            dist/B3-Configurator-macOS-arm64.zip \
+            dist/B3-Configurator-macOS-arm64.zip.sha256 \
+            dist/B3-Configurator-macOS-x86_64.zip \
+            dist/B3-Configurator-macOS-x86_64.zip.sha256
